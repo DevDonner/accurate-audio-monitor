@@ -24,20 +24,14 @@ export default function LiveSoundCapture() {
   useEffect(() => {
     eng
       .listMics()
-      .then((ds) => {
-        setMics(ds)
-        setMicId((cur) => cur || ds[0]?.deviceId || '')
-      })
+      .then(setMics)
       .catch((e) => setErr(micErrMsg(e)))
     return () => eng.destroy()
   }, [eng])
 
+  // micId '' means "browser default microphone" — always a valid choice.
   const start = async () => {
     setErr(null)
-    if (!micId) {
-      setErr('Pick a microphone first.')
-      return
-    }
     try {
       await eng.start(micId)
     } catch (e) {
@@ -213,7 +207,7 @@ function MeterCard(props: {
           disabled={eng.state !== 'idle'}
           className="rounded bg-neutral-950 border border-neutral-800 px-2 py-1.5 text-xs text-neutral-200 outline-none focus:border-neutral-500 disabled:opacity-40 max-w-56"
         >
-          {mics.length === 0 && <option value="">no microphones found</option>}
+          <option value="">Default microphone</option>
           {mics.map((m) => (
             <option key={m.deviceId} value={m.deviceId}>
               {m.label}
@@ -237,6 +231,12 @@ function MeterCard(props: {
           </button>
         )}
       </div>
+      {mics.length === 0 && (
+        <p className="mt-2 text-xs text-neutral-500">
+          No named microphones yet — &ldquo;Default microphone&rdquo; still works. Click
+          &ldquo;Name mics&rdquo; to let the browser list them by name.
+        </p>
+      )}
       {err && <p className="mt-2 text-xs text-red-400">{err}</p>}
     </div>
   )

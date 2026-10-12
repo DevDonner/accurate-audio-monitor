@@ -201,7 +201,9 @@ export class LiveSoundEngine {
   async listMics(): Promise<MicDevice[]> {
     const devices = await navigator.mediaDevices.enumerateDevices()
     return devices
-      .filter((d) => d.kind === 'audioinput')
+      // Browsers hide device IDs until permission is granted; those empty-ID
+      // placeholders are useless in the picker, so skip them.
+      .filter((d) => d.kind === 'audioinput' && d.deviceId !== '')
       .map((d) => ({
         deviceId: d.deviceId,
         label: d.label || `Mic ${d.deviceId.slice(0, 8)}`,
@@ -221,17 +223,17 @@ export class LiveSoundEngine {
 
   // ------------------------------------------------------------- monitor
 
+  /** `deviceId` may be '' — meaning "the browser's default microphone". */
   async start(deviceId: string): Promise<void> {
     if (this.state !== 'idle') throw new Error('Already running — stop it first.')
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: { exact: deviceId },
-        // Evidence, not a call: no processing that would reshape the sound.
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    })
+    const audio: MediaTrackConstraints = {
+      // Evidence, not a call: no processing that would reshape the sound.
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    }
+    if (deviceId !== '') audio.deviceId = { exact: deviceId }
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio })
     this.ctx = new AudioContext()
     if (this.ctx.state === 'suspended') await this.ctx.resume()
     await this.ctx.audioWorklet.addModule(workletUrl())
@@ -240,8 +242,12 @@ export class LiveSoundEngine {
     this.ctx.createMediaStreamSource(this.stream).connect(this.node)
 
     this.sampleRate = this.ctx.sampleRate
+    // Permission is granted now, so re-enumeration yields real labels —
+    // resolve against the device the track actually came from.
+    const usedId = this.stream.getAudioTracks()[0]?.getSettings().deviceId ?? ''
     this.micLabel =
-      (await this.listMics()).find((d) => d.deviceId === deviceId)?.label ?? 'selected mic'
+      (await this.listMics()).find((d) => d.deviceId === usedId)?.label ??
+      (deviceId === '' ? 'default microphone' : 'selected mic')
     this.resetPreRoll()
     this.history = []
     this.aboveMs = 0
