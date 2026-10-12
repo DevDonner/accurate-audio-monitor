@@ -10,18 +10,20 @@ mic ── getUserMedia ──► MediaStreamSource ──► AudioWorkletNode("
                                                          │
                                                          ▼
    ┌────────────────────────── state machine (engine.ts) ──────────────────────────┐
-   │  pre-roll ring buffer ◄── every sample                                          │
-   │  IDLE:      db ≥ triggerDb for triggerHoldMs ──► RECORDING                      │
-   │  RECORDING: db ≤ stopDb for stopHoldMs (age ≥ minClipSec) ──► IDLE              │
-   │             age ≥ maxClipSec ──► IDLE                                            │
-   └────────────────────────────────────────────────────────────────────────────────┘
-        │ trigger/stop events                │ clip end
-        ▼                                    ▼
-  append-only event log              WAV encode (wav.ts) ──► Clip { blob, url, saved }
-        │                                                │
-        ▼                                                ▼
-  noise-events.csv + session.json            save folder (File System Access API)
-  (File System Access API)                   2026-10-12_02-14-33_noise.wav
+   │  pre-roll ring buffer ◄── every sample                                        │
+    │  gate OFF (default): a clip is always running                                │
+    │             age ≥ maxClipSec ──► IDLE ──► next clip on next quantum          │
+    │  gate ON:     IDLE: db ≥ triggerDb for triggerHoldMs ──► RECORDING           │
+    │             RECORDING: db ≤ stopDb for stopHoldMs (age ≥ minClipSec) ──► IDLE│
+
+    └────────────────────────────────────────────────────────────────────────────────┘
+         │ trigger/stop events                │ clip end
+         ▼                                    ▼
+   append-only event log              WAV encode (wav.ts) ──► Clip { blob, url, saved }
+         │                                                │
+         ▼                                                ▼
+   noise-events.csv + session.json            save folder (File System Access API)
+   (File System Access API)                   2026-10-12_02-14-33_noise.wav
 ```
 
 ## The detection state machine
@@ -31,6 +33,18 @@ wall clock — hold times are sample-accurate and survive tab throttling
 drift. The wall clock (`Date.now()`) is recorded at each boundary for the
 log.
 
+**Default: gate OFF — continuous recording.** There is no level condition
+at all: monitoring starts a clip immediately, the clip runs until
+`maxClipSec`, then the next clip starts on the very next quantum. This is
+the safe evidence mode — a threshold can always be set too high (quiet
+room, distant noise, low mic gain) and miss everything, but a continuous
+recording misses nothing. The only cost is disk: 60 s mono @ 48 kHz ≈
+5.8 MB per file. Consecutive files overlap by the pre-roll (~2 s) so no
+second is lost at the seams.
+
+**Gate ON — trigger with hysteresis** (opt-in for people who want
+"loud moments only"):
+
 | Condition | Action |
 | --- | --- |
 | `IDLE`, `db ≥ triggerDb` | accumulate `aboveMs`; at `triggerHoldMs` → start clip |
@@ -39,9 +53,9 @@ log.
 | `RECORDING`, `age ≥ minClipSec` and `db ≤ stopDb` for `stopHoldMs` | end clip ("quiet") |
 | `RECORDING`, `age ≥ maxClipSec` | end clip ("max duration") |
 
-Defaults: trigger −20 dBFS / 300 ms, stop −40 dBFS / 2000 ms, max 60 s,
-min 1 s, pre-roll 2 s. Stop below trigger (hysteresis) prevents a steady
-noise from flapping start/stop every loop.
+Defaults (used only when gated): trigger −20 dBFS / 300 ms, stop
+−40 dBFS / 2000 ms, max 60 s, min 1 s, pre-roll 2 s. Stop below trigger
+(hysteresis) prevents a steady noise from flapping start/stop every loop.
 
 ## Pre-roll
 
@@ -64,6 +78,12 @@ Fields: `seq`, `ts` (epoch ms), `iso` (local ISO 8601 with offset),
 `audioTime` (AudioContext seconds, null if unknown), `type`, `message`,
 `db` (raw dBFS at event time), `clipId`.
 
+`audioTime` note: current Chrome/Edge expose no clock inside the worklet
+scope (`AudioWorkletProcessor.currentTime` was removed), so the engine owns
+the audio clock on the main thread: anchored to `ctx.currentTime` at monitor
+start, advanced exactly 128 samples per quantum. If a browser does report a
+context time, it is used directly.
+
 `noise-events.csv` columns: `seq, timestamp_local, timestamp_utc, type,
 message, dbfs, clip_id` — message is RFC-4180 quoted when needed.
 
@@ -81,9 +101,21 @@ the numbers do and don't mean.
 
 ## Persistence
 
-`localStorage`: `live-sound-capture.config` (thresholds),
-`live-sound-capture.calibration` (offset). Both ignored gracefully when
-storage is unavailable.
+- `localStorage`: `live-sound-capture.config` (mode + thresholds),
+  `live-sound-capture.calibration` (offset). Both ignored gracefully when
+  storage is unavailable.
+- `IndexedDB` (`live-sound-capture` / `handles`): the chosen save-folder
+  `FileSystemDirectoryHandle`. On load the engine calls `queryPermission`;
+  if still granted the folder is reattached silently and auto-save resumes,
+  otherwise a "Reconnect folder" button re-requests permission on click
+  (the browser requires a user gesture for `requestPermission`).
+
+## Auto-save
+
+Clips are written to the folder **the moment they finish** — no manual
+"Save" click. The manual buttons remain for the no-folder case and for
+flushing clips that failed to write. The event log CSV/JSON refresh on
+stop, on folder (re)connect, and on demand.
 
 ## File map
 

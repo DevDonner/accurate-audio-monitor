@@ -2,7 +2,9 @@
 //
 // Data flow:
 //   mic -> MediaStreamSource -> AudioWorklet("live-capture")
-//        -> per-quantum message { rms, samples, t } -> state machine
+//        -> per-quantum message { rms, samples, t? } -> state machine
+//   (t = context clock when the worklet exposes it; the engine otherwise
+//    owns the clock and advances it one 128-sample quantum per message)
 //
 // State machine (runs on the audio-clock, so hold timers are sample-accurate):
 //   IDLE(listening) --db >= triggerDb for triggerHoldMs--> RECORDING
@@ -16,6 +18,7 @@ import { encodeWav } from './wav'
 import type { Clip, EngineConfig, EngineState, LogEvent, LogType, MicDevice } from './types'
 
 export const DEFAULT_CONFIG: EngineConfig = {
+  gated: false, // continuous recording by default — the safe evidence mode
   triggerDb: -20,
   stopDb: -40,
   triggerHoldMs: 300,
@@ -46,10 +49,13 @@ class CaptureProcessor extends AudioWorkletProcessor {
       }
       const rms = Math.sqrt(sum / ch.length);
       const copy = new Float32Array(ch);
-      this.port.postMessage(
-        { rms: rms, t: this.context.currentTime, samples: copy },
-        [copy.buffer],
-      );
+      // The engine owns the audio clock (main thread). Include the context
+      // clock too when this browser exposes it on the processor — current
+      // Chrome/Edge removed currentTime/sampleRate from the worklet scope,
+      // so the time field is often absent and the engine estimates it.
+      const msg = { rms: rms, samples: copy };
+      if (typeof this.currentTime === 'number') msg.t = this.currentTime;
+      this.port.postMessage(msg, [copy.buffer]);
     }
     return true;
   }
@@ -107,6 +113,47 @@ function saveJson(key: string, value: unknown): void {
   }
 }
 
+// ------------------------------------------------- folder persistence (IDB)
+// Directory handles can be stored in IndexedDB and re-requested on the next
+// visit, so the evidence folder survives page reloads / browser restarts.
+
+const IDB_NAME = 'live-sound-capture'
+const IDB_STORE = 'handles'
+
+/** TS's lib.dom doesn't have these File System Access permission methods yet. */
+interface FsPermissionMethods {
+  queryPermission(desc: { mode: 'readwrite' }): Promise<PermissionState>
+  requestPermission(desc: { mode: 'readwrite' }): Promise<PermissionState>
+}
+
+function idbOpen(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1)
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function idbGet<T>(key: string): Promise<T | undefined> {
+  const db = await idbOpen()
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(key)
+    req.onsuccess = () => resolve(req.result as T | undefined)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function idbSet(key: string, value: unknown): Promise<void> {
+  const db = await idbOpen()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite')
+    tx.objectStore(IDB_STORE).put(value, key)
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
 let workletUrlCache: string | null = null
 function workletUrl(): string {
   if (!workletUrlCache) {
@@ -150,6 +197,7 @@ export class LiveSoundEngine {
   private ctx: AudioContext | null = null
   private stream: MediaStream | null = null
   private node: AudioWorkletNode | null = null
+  private sink: GainNode | null = null
   private preRoll = new Float32Array(0)
   private preRollIdx = 0
   private active: ActiveClip | null = null
@@ -158,6 +206,8 @@ export class LiveSoundEngine {
   private lastAudioTime: number | null = null
   private seq = 0
   private listeners = new Set<() => void>()
+  /** Folder handle from a previous visit, awaiting the one-click reconnect. */
+  private pendingFolder: FileSystemDirectoryHandle | null = null
 
   constructor() {
     this.config = { ...DEFAULT_CONFIG, ...(loadJson<Partial<EngineConfig>>(CONFIG_KEY) ?? {}) }
@@ -240,6 +290,14 @@ export class LiveSoundEngine {
     this.node = new AudioWorkletNode(this.ctx, 'live-capture')
     this.node.port.onmessage = (ev: MessageEvent) => this.onQuantum(ev.data)
     this.ctx.createMediaStreamSource(this.stream).connect(this.node)
+    // Chrome/Edge will not run a worklet whose output never reaches the
+    // destination — even with a live MediaStreamSource feeding it. Route the
+    // output through a zero-gain sink so the graph is pulled (and the mic
+    // is never audible).
+    this.sink = this.ctx.createGain()
+    this.sink.gain.value = 0
+    this.node.connect(this.sink)
+    this.sink.connect(this.ctx.destination)
 
     this.sampleRate = this.ctx.sampleRate
     // Permission is granted now, so re-enumeration yields real labels —
@@ -256,10 +314,13 @@ export class LiveSoundEngine {
     this.state = 'listening'
     this.pushLog(
       'monitor-start',
-      `Monitoring on “${this.micLabel}” @ ${this.sampleRate} Hz — trigger ${this.config.triggerDb} dBFS, stop ${this.config.stopDb} dBFS`,
+      this.config.gated
+        ? `Monitoring on “${this.micLabel}” @ ${this.sampleRate} Hz — clips fire above ${this.config.triggerDb} dBFS`
+        : `Monitoring on “${this.micLabel}” @ ${this.sampleRate} Hz — recording continuously, ${this.config.maxClipSec} s clips`,
       null,
       null,
     )
+    if (!this.config.gated) this.startClip(this.ctx.currentTime, this.levelDb, 'continuous')
     this.emit()
   }
 
@@ -270,6 +331,7 @@ export class LiveSoundEngine {
     this.stream?.getTracks().forEach((t) => t.stop())
     void this.ctx?.close().catch(() => {})
     this.node = null
+    this.sink = null
     this.stream = null
     this.ctx = null
     this.sampleRate = null
@@ -292,12 +354,21 @@ export class LiveSoundEngine {
 
   // ---------------------------------------------------- detection core
 
-  private onQuantum(m: { rms: number; t: number; samples: Float32Array }): void {
+  private onQuantum(m: { rms: number; samples: Float32Array; t?: number }): void {
     const db = dbFromRms(m.rms)
     const sr = this.sampleRate ?? 48000
-    const dtMs =
-      this.lastAudioTime == null ? (128000 / sr) : (m.t - this.lastAudioTime) * 1000
-    this.lastAudioTime = m.t
+    // The engine owns the audio clock: use the worklet-reported context time
+    // when available, otherwise advance exactly one 128-sample quantum per
+    // message (anchored to the context clock at monitor start).
+    const prev = this.lastAudioTime
+    const now: number =
+      typeof m.t === 'number'
+        ? m.t
+        : prev == null
+          ? (this.ctx ? this.ctx.currentTime : 0)
+          : prev + 128 / sr
+    this.lastAudioTime = now
+    const dtMs = prev == null ? 128000 / sr : (now - prev) * 1000
 
     this.levelDb = db
     this.history.push(db)
@@ -309,23 +380,34 @@ export class LiveSoundEngine {
     if (this.state !== 'listening' && this.state !== 'recording') return
 
     if (!this.active) {
-      if (db >= this.config.triggerDb) {
-        this.aboveMs += dtMs
-        if (this.aboveMs >= this.config.triggerHoldMs) this.startClip(m.t, db)
+      if (this.config.gated) {
+        if (db >= this.config.triggerDb) {
+          this.aboveMs += dtMs
+          if (this.aboveMs >= this.config.triggerHoldMs) this.startClip(now, db, 'trigger')
+        } else {
+          this.aboveMs = 0
+        }
       } else {
-        this.aboveMs = 0
+        // Ungated: a clip must always be running — (re)start immediately.
+        this.startClip(now, db, 'continuous')
       }
     } else {
       this.active.chunks.push(m.samples)
       this.active.length += m.samples.length
       if (db > this.active.peakDb) this.active.peakDb = db
-      this.belowMs = db <= this.config.stopDb ? this.belowMs + dtMs : 0
+      if (this.config.gated) {
+        this.belowMs = db <= this.config.stopDb ? this.belowMs + dtMs : 0
+      }
 
-      const ageSec = m.t - this.active.startAudioTime
-      if (ageSec >= this.config.minClipSec && this.belowMs >= this.config.stopHoldMs) {
-        this.endClip('quiet', m.t, db)
+      const ageSec = now - this.active.startAudioTime
+      if (
+        this.config.gated &&
+        ageSec >= this.config.minClipSec &&
+        this.belowMs >= this.config.stopHoldMs
+      ) {
+        this.endClip('quiet', now, db)
       } else if (ageSec >= this.config.maxClipSec) {
-        this.endClip('max duration', m.t, db)
+        this.endClip('max duration', now, db)
       }
     }
   }
@@ -351,7 +433,14 @@ export class LiveSoundEngine {
     this.preRollIdx = 0
   }
 
-  private startClip(t: number, db: number): void {
+  /** Age of the in-progress clip, for the UI's "REC 0:37 / 1:00" row. */
+  get activeClip(): { startTs: number; ageSec: number } | null {
+    const a = this.active
+    if (!a) return null
+    return { startTs: a.startTs, ageSec: Math.max(0, (this.lastAudioTime ?? 0) - a.startAudioTime) }
+  }
+
+  private startClip(t: number, db: number, reason: 'trigger' | 'continuous'): void {
     const chunks: Float32Array[] = []
     let length = 0
     if (this.preRoll.length > 0) {
@@ -375,7 +464,9 @@ export class LiveSoundEngine {
     this.state = 'recording'
     this.pushLog(
       'trigger',
-      `Noise ${db.toFixed(1)} dBFS — above ${this.config.triggerDb} dBFS for ${Math.round(this.aboveMs)} ms`,
+      reason === 'continuous'
+        ? `Clip started (gate off) — will run ${this.config.maxClipSec} s`
+        : `Noise ${db.toFixed(1)} dBFS — above ${this.config.triggerDb} dBFS for ${Math.round(this.aboveMs)} ms`,
       db,
       null,
     )
@@ -412,6 +503,13 @@ export class LiveSoundEngine {
       db,
       clip.id,
     )
+    // Evidence must not wait for a manual click: the moment a clip exists,
+    // it goes to the save folder if one is connected.
+    if (this.folder) {
+      void this.saveClip(clip).catch((e) =>
+        this.pushLog('error', `Auto-save failed for ${clip.name}: ${errMsgOf(e)}`, null, clip.id),
+      )
+    }
     this.emit()
   }
 
@@ -432,6 +530,7 @@ export class LiveSoundEngine {
   setConfig(patch: Partial<EngineConfig>): void {
     const c = this.config
     this.config = {
+      gated: patch.gated ?? c.gated,
       triggerDb: clamp(patch.triggerDb ?? c.triggerDb, -90, 0),
       stopDb: clamp(patch.stopDb ?? c.stopDb, -90, 0),
       triggerHoldMs: clamp(patch.triggerHoldMs ?? c.triggerHoldMs, 0, 10000),
@@ -442,9 +541,20 @@ export class LiveSoundEngine {
     }
     saveJson(CONFIG_KEY, this.config)
     if (this.state !== 'idle') this.resetPreRoll()
+    // Turning the gate off mid-session should start recording right away.
+    if (
+      !this.config.gated &&
+      this.state === 'listening' &&
+      !this.active &&
+      this.ctx
+    ) {
+      this.startClip(this.ctx.currentTime, this.levelDb, 'continuous')
+    }
     this.pushLog(
       'config',
-      `trigger ${this.config.triggerDb} dBFS / stop ${this.config.stopDb} dBFS / hold ${this.config.triggerHoldMs}+${this.config.stopHoldMs} ms / pre-roll ${this.config.preRollSec} s / max ${this.config.maxClipSec} s`,
+      this.config.gated
+        ? `Gate ON — trigger ${this.config.triggerDb} dBFS / stop ${this.config.stopDb} dBFS / hold ${this.config.triggerHoldMs}+${this.config.stopHoldMs} ms`
+        : `Gate OFF — recording continuously, new clip every ${this.config.maxClipSec} s`,
       null,
       null,
     )
@@ -489,6 +599,11 @@ export class LiveSoundEngine {
 
   // ---------------------------------------------------------------- save
 
+  /** Previously chosen folder awaiting a click-to-reconnect (see restoreFolder). */
+  get pendingFolderName(): string | null {
+    return this.pendingFolder?.name ?? null
+  }
+
   async chooseFolder(): Promise<void> {
     if (!this.fsSupported) {
       throw new Error('This browser cannot write to folders — use the per-clip downloads instead.')
@@ -499,9 +614,64 @@ export class LiveSoundEngine {
     const handle = await w.showDirectoryPicker!({ mode: 'readwrite' })
     this.folder = handle
     this.folderName = handle.name
+    this.pendingFolder = null
+    void idbSet('folder', handle).catch(() => {})
     this.pushLog('folder', `Save folder: “${handle.name}” — auto-saving clips here`, null, null)
     await this.saveAllClips()
     await this.saveEventLog()
+    this.emit()
+  }
+
+  /**
+   * Called on page load: if a folder was chosen before, reattach it.
+   * Browsers keep the granted permission in many cases; otherwise the handle
+   * is stashed as pendingFolder and the UI offers a one-click reconnect.
+   */
+  async restoreFolder(): Promise<void> {
+    if (!this.fsSupported || this.folder) return
+    let handle: FileSystemDirectoryHandle | null = null
+    try {
+      handle = (await idbGet<FileSystemDirectoryHandle>('folder')) ?? null
+    } catch {
+      return
+    }
+    if (!handle) return
+    try {
+      const perm = await (handle as unknown as FsPermissionMethods).queryPermission({
+        mode: 'readwrite',
+      })
+      if (perm === 'granted') {
+        this.folder = handle
+        this.folderName = handle.name
+        this.pushLog('folder', `Reconnected save folder: “${handle.name}”`, null, null)
+      } else {
+        this.pendingFolder = handle
+        this.pushLog(
+          'folder',
+          `Save folder “${handle.name}” found — click “Reconnect folder” to re-allow access`,
+          null,
+          null,
+        )
+      }
+    } catch {
+      /* handle no longer usable */
+    }
+    this.emit()
+  }
+
+  /** Must run inside a user gesture — the browser requires one for requestPermission. */
+  async reconnectFolder(): Promise<void> {
+    const handle = this.pendingFolder
+    if (!handle) throw new Error('No saved folder to reconnect.')
+    const perm = await (handle as unknown as FsPermissionMethods).requestPermission({
+      mode: 'readwrite',
+    })
+    if (perm !== 'granted') throw new Error('Folder permission was not granted.')
+    this.folder = handle
+    this.folderName = handle.name
+    this.pendingFolder = null
+    this.pushLog('folder', `Reconnected save folder: “${handle.name}” — auto-saving clips here`, null, null)
+    await this.saveAllClips()
     this.emit()
   }
 
@@ -581,6 +751,10 @@ export class LiveSoundEngine {
       2,
     )
   }
+}
+
+function errMsgOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }
 
 function concatChunks(chunks: Float32Array[], length: number): Float32Array {

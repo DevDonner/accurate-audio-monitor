@@ -3,7 +3,14 @@
 export type EngineState = 'idle' | 'listening' | 'recording'
 
 export interface EngineConfig {
-  /** dBFS level that arms a clip (with triggerHoldMs of sustain). */
+  /**
+   * Gate recording on loud sound. OFF (default) = record continuously:
+   * a clip runs until maxClipSec, then the next one starts. This is the
+   * safe evidence mode — nothing is missed regardless of threshold.
+   * ON = the triggerDb/stopDb/hold logic applies.
+   */
+  gated: boolean
+  /** dBFS level that arms a clip (with triggerHoldMs of sustain). Only used when gated. */
   triggerDb: number
   /** dBFS level a clip must fall below (for stopHoldMs) to stop. Keep below triggerDb. */
   stopDb: number

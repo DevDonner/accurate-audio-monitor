@@ -1,19 +1,22 @@
 # Live Sound Capture — Lab
 
 **Lab #2 for the [DevDonner portfolio](https://github.com/DevDonner/portfolioWebsite).**
-An always-listening noise witness: pick a mic, set a trigger level, and it
-records only the loud moments — timestamped 16-bit WAV clips plus a full
-event log, saved straight into a folder you choose.
+An always-recording noise witness: pick a mic and a folder, and it records
+continuously — timestamped 16-bit WAV clips (60 s each by default) plus a
+full event log, auto-saved straight into the folder the moment each clip
+finishes. A loud-sound gate (opt-in) switches it to "only record the loud
+moments" mode.
 
-> **Pitch:** "A night-watchman for your microphone. It listens all night,
+> **Pitch:** "A night-watchman for your microphone. It records all night,
 > writes nothing but the evidence — each clip a WAV, every second logged."
 
 ## Status
 - [x] Repo scaffolded (2026-10-12)
 - [x] Engine: detection state machine, pre-roll, WAV encoder
 - [x] UI: meter, thresholds, calibration, activity feed, clip list
-- [x] Save flow: File System Access folder + event log export
-- [ ] Verified end-to-end on real hardware (trigger → save → playback)
+- [x] Save flow: File System Access folder + event log export (auto-save on clip end, folder persists across reloads)
+- [x] Default mode: continuous recording (gate is opt-in)
+- [ ] Verified end-to-end on real hardware (record → save → playback)
 - [ ] Hosted at `portfolio.devdonner…/lab/live-sound-capture` (placeholder — see portfolio repo)
 
 ## What this repo is
@@ -26,15 +29,20 @@ verified by a production build.
 
 ## How it works
 
-- **Always listening.** A mic is selected via `getUserMedia` (device picker).
-  An `AudioWorklet` computes RMS per 128-sample quantum and posts it to the
-  page. No echo cancellation, noise suppression, or AGC — the sound is left
-  exactly as the mic heard it.
-- **Trigger with hysteresis.** A clip starts when the level stays ≥
-  *trigger dBFS* for the *trigger hold* (default: −20 dBFS for 300 ms, so a
-  single creak doesn't open a six-minute file). It stops when the level stays
-  ≤ *stop dBFS* (default −40) for the *stop hold* (default 2 s), with a hard
-  max clip length (default 60 s) and a minimum clip age (1 s).
+- **Always recording (default).** A mic is selected via `getUserMedia`
+  (device picker). An `AudioWorklet` computes RMS per 128-sample quantum and
+  posts it to the page. No echo cancellation, noise suppression, or AGC — the
+  sound is left exactly as the mic heard it. By default there is **no level
+  gate**: a clip runs from start until it hits the max length (default 60 s),
+  then the next one begins. Nothing is missed, no matter how quiet the room
+  or how high the threshold would have been. Consecutive files overlap by the
+  pre-roll (~2 s) so no second is lost between them.
+- **Loud-sound gate (opt-in).** Tick "Gate on loud sound" and the classic
+  trigger-with-hysteresis state machine takes over: a clip starts when the
+  level stays ≥ *trigger dBFS* for the *trigger hold* (default: −20 dBFS for
+  300 ms, so a single creak doesn't open a six-minute file) and stops when the
+  level stays ≤ *stop dBFS* (default −40) for the *stop hold* (default 2 s),
+  with a hard max clip length (60 s) and minimum clip age (1 s).
 - **Pre-roll.** A ring buffer keeps the last N seconds (default 2) of audio,
   so each clip starts *before* the noise — the context is part of the record.
 - **WAV, not webm.** Clips are encoded as 16-bit PCM WAV in JS (`wav.ts`,
@@ -43,6 +51,11 @@ verified by a production build.
   an in-memory log with wall-clock (local ISO + UTC) and audio-clock
   timestamps, exported as `noise-events.csv` plus a `session.json` that
   snapshots the mic, sample rate, thresholds, and calibration.
+- **Auto-save, for real.** The instant a clip finishes it is written to the
+  chosen folder (File System Access API) — no manual "Save" click required.
+  The folder handle is persisted in IndexedDB, so after a reload the app
+  reattaches it automatically (or offers a one-click "Reconnect folder" if the
+  browser wants to re-ask permission).
 - **Calibration, honestly.** Browsers measure **dBFS** — relative to the
   mic's own digital ceiling — not calibrated sound pressure (dB SPL). A
   single-point calibration (play a known source at the mic, enter its real dB)
