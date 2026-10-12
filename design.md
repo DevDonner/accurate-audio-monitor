@@ -9,14 +9,13 @@ mic ── getUserMedia ──► MediaStreamSource ──► AudioWorkletNode("
                        { rms, samples: Float32Array, t: AudioContext time }
                                                          │
                                                          ▼
-   ┌────────────────────────── state machine (engine.ts) ──────────────────────────┐
-   │  pre-roll ring buffer ◄── every sample                                        │
-    │  gate OFF (default): a clip is always running                                │
-    │             age ≥ maxClipSec ──► IDLE ──► next clip on next quantum          │
-    │  gate ON:     IDLE: db ≥ triggerDb for triggerHoldMs ──► RECORDING           │
-    │             RECORDING: db ≤ stopDb for stopHoldMs (age ≥ minClipSec) ──► IDLE│
-
-    └────────────────────────────────────────────────────────────────────────────────┘
+   ┌────────────────────────── state machine (engine.ts)───────────────────────────┐
+   │  a clip is ALWAYS running — recording never pauses between clips              │
+   │  END + SAVE  level ≥ triggerDb held triggerHoldMs (armed; re-arms on dip)     │
+   │  END         stopOnQuiet: level ≤ stopDb held stopHoldMs, age ≥ minClipSec    │
+   │  END         age ≥ maxClipSec                                                 │
+   │  keep iff peakDb ≥ triggerDb — else discarded (room tone, logged)             │
+   └───────────────────────────────────────────────────────────────────────────────┘
          │ trigger/stop events                │ clip end
          ▼                                    ▼
    append-only event log              WAV encode (wav.ts) ──► Clip { blob, url, saved }
@@ -33,36 +32,41 @@ wall clock — hold times are sample-accurate and survive tab throttling
 drift. The wall clock (`Date.now()`) is recorded at each boundary for the
 log.
 
-**Default: gate OFF — continuous recording.** There is no level condition
-at all: monitoring starts a clip immediately, the clip runs until
-`maxClipSec`, then the next clip starts on the very next quantum. This is
-the safe evidence mode — a threshold can always be set too high (quiet
-room, distant noise, low mic gain) and miss everything, but a continuous
-recording misses nothing. The only cost is disk: 60 s mono @ 48 kHz ≈
-5.8 MB per file. Consecutive files overlap by the pre-roll (~2 s) so no
-second is lost at the seams.
-
-**Gate ON — trigger with hysteresis** (opt-in for people who want
-"loud moments only"):
+**There is no idle state — a clip is always running.** Monitoring starts a
+clip immediately, and the quantum after any clip ends starts the next.
+Three boundaries end a clip:
 
 | Condition | Action |
 | --- | --- |
-| `IDLE`, `db ≥ triggerDb` | accumulate `aboveMs`; at `triggerHoldMs` → start clip |
-| `IDLE`, `db < triggerDb` | `aboveMs = 0` |
-| `RECORDING`, append samples; track `peakDb` | — |
-| `RECORDING`, `age ≥ minClipSec` and `db ≤ stopDb` for `stopHoldMs` | end clip ("quiet") |
-| `RECORDING`, `age ≥ maxClipSec` | end clip ("max duration") |
+| armed, `db ≥ triggerDb` held for `triggerHoldMs` | end ("trigger") → next clip starts **disarmed** |
+| `stopOnQuiet`, `age ≥ minClipSec`, `db ≤ stopDb` held for `stopHoldMs` | end ("quiet") → next clip starts armed |
+| `age ≥ maxClipSec` | end ("max duration") → next clip armed iff `db < triggerDb` |
 
-Defaults (used only when gated): trigger −20 dBFS / 300 ms, stop
-−40 dBFS / 2000 ms, max 60 s, min 1 s, pre-roll 2 s. Stop below trigger
-(hysteresis) prevents a steady noise from flapping start/stop every loop.
+An ended clip is **kept** iff `peakDb ≥ triggerDb` — it contains audio at
+the evidence level. Kept clips go to the clip list and, with auto-save on,
+straight to the save folder; everything else is room tone and gets
+discarded (object URL revoked) with one log line. This is what makes
+"always recording" cheap: memory and disk hold only the loud moments.
+
+**Re-arm on dip.** A clip that starts while the level is already loud
+(the one that begins right after a trigger) starts *disarmed* and only
+arms once the level drops back below the trigger. Sustained loud sound
+therefore produces `maxClipSec`-long clips, never a flood of
+`triggerHoldMs` slivers; a dip below the trigger and a rise again arms the
+next episode.
+
+`stopOnQuiet` is **off** by default — clips run the full `maxClipSec`.
+Defaults: trigger −20 dBFS / 300 ms, stop −40 dBFS / 2000 ms, max 60 s,
+min 1 s, pre-roll 2 s. Stop below trigger (hysteresis) prevents a steady
+noise from flapping clip boundaries every loop.
 
 ## Pre-roll
 
 A `Float32Array` ring of `preRollSec × sampleRate` samples, written for every
-quantum while monitoring. On trigger it is dumped oldest-first and prepended
-to the clip's chunks. The ring is reallocated when `preRollSec` changes or
-monitoring starts.
+quantum while monitoring. When a new clip starts it is dumped oldest-first and
+prepended to the clip's chunks — so every clip carries the seconds before its
+boundary. The ring is reallocated when `preRollSec` changes or monitoring
+starts.
 
 ## Clip assembly
 
@@ -70,13 +74,24 @@ monitoring starts.
 `encodeWav` (44-byte RIFF header, 16-bit little-endian PCM, mono, native
 sample rate — typically 44.1 or 48 kHz). Memory: a 60 s clip ≈ 10.5 MB raw /
 5.3 MB WAV. In-memory clip cap is 100; the oldest is evicted with an `error`
-log entry prompting the user to save.
+log entry prompting the user to save. A reviewed clip can also be dropped by
+the user (per-clip Delete): spliced from the list, object URL revoked, and a
+`delete` event records the removal (noting whether a disk copy exists). The
+UI is two-step — Delete arms a pulsing Confirm that auto-cancels after ~4 s
+— so evidence can't be lost to a stray click. Delete never touches files
+already in the save folder.
 
 ## Event log
 
 Fields: `seq`, `ts` (epoch ms), `iso` (local ISO 8601 with offset),
 `audioTime` (AudioContext seconds, null if unknown), `type`, `message`,
-`db` (raw dBFS at event time), `clipId`.
+`db` (raw dBFS at event time), `clipId`, `internal` (optional — present only
+on background events).
+
+The live Activity feed renders only non-`internal` events (saves + system
+changes). Background events — each clip's `started` line and clip ends that are
+discarded as room tone — stay in the log and in `noise-events.csv` but are
+hidden from the feed, so a quiet night doesn't scroll it.
 
 `audioTime` note: current Chrome/Edge expose no clock inside the worklet
 scope (`AudioWorkletProcessor.currentTime` was removed), so the engine owns
@@ -106,16 +121,17 @@ the numbers do and don't mean.
   storage is unavailable.
 - `IndexedDB` (`live-sound-capture` / `handles`): the chosen save-folder
   `FileSystemDirectoryHandle`. On load the engine calls `queryPermission`;
-  if still granted the folder is reattached silently and auto-save resumes,
-  otherwise a "Reconnect folder" button re-requests permission on click
-  (the browser requires a user gesture for `requestPermission`).
+  if still granted the folder is reattached silently, otherwise a
+  "Reconnect folder" button re-requests permission on click (the browser
+  requires a user gesture for `requestPermission`).
 
 ## Auto-save
 
-Clips are written to the folder **the moment they finish** — no manual
-"Save" click. The manual buttons remain for the no-folder case and for
-flushing clips that failed to write. The event log CSV/JSON refresh on
-stop, on folder (re)connect, and on demand.
+Opt-in (`autoSave`, default **off**): the folder is only touched when the
+user says so. When on, kept clips are written the moment they end — no
+manual "Save" click — and the event log CSV/JSON refresh on stop and on
+folder (re)connect. When off, the explicit buttons do the writing:
+"Save clips", "Event log", and per-clip "Download".
 
 ## File map
 

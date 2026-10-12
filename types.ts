@@ -4,19 +4,23 @@ export type EngineState = 'idle' | 'listening' | 'recording'
 
 export interface EngineConfig {
   /**
-   * Gate recording on loud sound. OFF (default) = record continuously:
-   * a clip runs until maxClipSec, then the next one starts. This is the
-   * safe evidence mode — nothing is missed regardless of threshold.
-   * ON = the triggerDb/stopDb/hold logic applies.
+   * Optional quiet-stop. ON = a clip also ends (and saves, if it contains a
+   * trigger) as soon as the sound drops below stopDb for stopHoldMs.
+   * OFF (default) = clips run the full maxClipSec before ending.
    */
-  gated: boolean
-  /** dBFS level that arms a clip (with triggerHoldMs of sustain). Only used when gated. */
+  stopOnQuiet: boolean
+  /** dBFS level that ends the current clip and saves it (with triggerHoldMs of sustain). */
   triggerDb: number
-  /** dBFS level a clip must fall below (for stopHoldMs) to stop. Keep below triggerDb. */
+  /**
+   * Write finished clips to the connected save folder the moment they end.
+   * OFF (default) = clips stay in memory; use "Save clips" / Download.
+   */
+  autoSave: boolean
+  /** dBFS level a clip must fall below (for stopHoldMs) to end. Keep below triggerDb. Only used when stopOnQuiet. */
   stopDb: number
-  /** Noise must stay ≥ triggerDb this long before a clip starts (spike guard). */
+  /** Noise must stay ≥ triggerDb this long before a clip ends (spike guard). */
   triggerHoldMs: number
-  /** Silence must stay ≤ stopDb this long before a clip stops. */
+  /** Silence must stay ≤ stopDb this long before a clip ends. Only used when stopOnQuiet. */
   stopHoldMs: number
   /** Hard cap on clip length. */
   maxClipSec: number
@@ -29,8 +33,10 @@ export interface EngineConfig {
 export type LogType =
   | 'monitor-start'
   | 'monitor-stop'
+  | 'clip'
   | 'trigger'
   | 'stop'
+  | 'delete'
   | 'config'
   | 'calibration'
   | 'folder'
@@ -49,21 +55,28 @@ export interface LogEvent {
   /** Raw dBFS at event time, when applicable. */
   db: number | null
   clipId: string | null
+  /**
+   * Background-only event: stays in the log (and in the exported event CSV)
+   * as the record, but is hidden from the user-facing Activity feed. Used for
+   * per-clip "started" lines and for clip ends that are discarded (room tone).
+   */
+  internal?: boolean
 }
 
 export interface Clip {
   id: string
   /** File name the WAV is saved under. */
   name: string
-  /** Wall-clock epoch ms when the trigger fired. */
+  /** Wall-clock epoch ms when the clip started. */
   startTs: number
-  /** Wall-clock epoch ms when the clip stopped. */
+  /** Wall-clock epoch ms when the clip ended. */
   endTs: number
-  /** Seconds of noise captured trigger→stop (pre-roll excluded). */
+  /** Seconds of audio from clip start to end (pre-roll excluded). */
   recSec: number
   /** Seconds of audio in the WAV file (includes pre-roll). */
   fileSec: number
   startDb: number
+  /** Peak level after the clip started (pre-roll excluded). */
   peakDb: number
   /** Encoded 16-bit WAV. */
   blob: Blob

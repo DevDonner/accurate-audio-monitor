@@ -41,15 +41,19 @@ export default function LiveSoundCapture() {
     }
   }
 
+  // Background events (per-clip "started", discarded room-tone clips) stay in
+  // the log/CSV but are hidden from the Activity feed.
+  const visibleLog = eng.log.filter((e) => !e.internal)
+
   return (
     <div className="h-full w-full flex flex-col bg-neutral-950 text-neutral-200 text-sm">
       <header className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800">
         <StatusDot state={eng.state} />
         <h1 className="font-semibold text-neutral-100">Live Sound Capture</h1>
         <span className="text-xs text-neutral-500 truncate">
-          {eng.config.gated
-            ? `noise witness — clips fire at ${eng.config.triggerDb} dBFS, stop at ${eng.config.stopDb} dBFS`
-            : `always recording — one ${eng.config.maxClipSec} s clip at a time, files land in the save folder automatically`}
+          {`always recording — a clip saves when the level crosses ${eng.config.triggerDb} dBFS${
+            eng.config.stopOnQuiet ? ', or when the sound goes quiet' : ''
+          }`}
         </span>
         {eng.state !== 'idle' && eng.micLabel && (
           <span className="ml-auto shrink-0 text-xs text-neutral-400">
@@ -76,24 +80,26 @@ export default function LiveSoundCapture() {
             <label className="flex items-center gap-2 text-xs mb-3 cursor-pointer select-none">
               <input
                 type="checkbox"
-                checked={eng.config.gated}
-                onChange={(e) => eng.setConfig({ gated: e.target.checked })}
+                checked={eng.config.stopOnQuiet}
+                onChange={(e) => eng.setConfig({ stopOnQuiet: e.target.checked })}
                 className="accent-amber-500"
               />
-              <span className="text-neutral-200">Gate on loud sound</span>
+              <span className="text-neutral-200">Stop clip when quiet</span>
               <span className="text-neutral-500">
-                {eng.config.gated
-                  ? 'wait for noise above the trigger level'
-                  : 'off = record continuously (recommended for evidence)'}
+                {eng.config.stopOnQuiet
+                  ? 'clip ends as soon as the sound drops below the stop level'
+                  : 'off = clips run the full max clip length'}
               </span>
             </label>
-            <div
-              className={`grid grid-cols-2 sm:grid-cols-4 gap-3 ${eng.config.gated ? '' : 'opacity-40 pointer-events-none'}`}
-            >
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <Field label="Trigger (dBFS)" value={eng.config.triggerDb} min={-90} max={0} step={1} onChange={(v) => eng.setConfig({ triggerDb: v })} />
-              <Field label="Stop (dBFS)" value={eng.config.stopDb} min={-90} max={0} step={1} onChange={(v) => eng.setConfig({ stopDb: v })} />
+              <div className={!eng.config.stopOnQuiet ? 'opacity-40 pointer-events-none' : ''}>
+                <Field label="Stop (dBFS)" value={eng.config.stopDb} min={-90} max={0} step={1} onChange={(v) => eng.setConfig({ stopDb: v })} />
+              </div>
               <Field label="Trigger hold (ms)" value={eng.config.triggerHoldMs} min={0} max={10000} step={50} onChange={(v) => eng.setConfig({ triggerHoldMs: v })} />
-              <Field label="Stop hold (ms)" value={eng.config.stopHoldMs} min={0} max={10000} step={100} onChange={(v) => eng.setConfig({ stopHoldMs: v })} />
+              <div className={!eng.config.stopOnQuiet ? 'opacity-40 pointer-events-none' : ''}>
+                <Field label="Stop hold (ms)" value={eng.config.stopHoldMs} min={0} max={10000} step={100} onChange={(v) => eng.setConfig({ stopHoldMs: v })} />
+              </div>
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3">
               <Field label="Pre-roll (s)" value={eng.config.preRollSec} min={0} max={10} step={0.5} onChange={(v) => eng.setConfig({ preRollSec: v })} />
@@ -148,10 +154,10 @@ export default function LiveSoundCapture() {
             Activity
           </h2>
           <div className="flex-1 min-h-0 overflow-y-auto font-mono text-[11px] leading-5 p-2">
-            {eng.log.length === 0 && (
+            {visibleLog.length === 0 && (
               <p className="text-neutral-600 font-sans">No events yet — start listening.</p>
             )}
-            {[...eng.log].reverse().map((e) => (
+            {[...visibleLog].reverse().map((e) => (
               <LogLine key={e.seq} e={e} />
             ))}
           </div>
@@ -285,14 +291,12 @@ function drawMeter(canvas: HTMLCanvasElement, eng: LiveSoundEngine): void {
     ctx.fillText(String(db), 4, yy - 2)
   }
 
-  if (eng.config.gated) {
-    markerLine(ctx, w, y(eng.config.stopDb), '#38bdf8', 'stop')
-    markerLine(ctx, w, y(eng.config.triggerDb), '#f59e0b', 'trigger')
-  }
+  markerLine(ctx, w, y(eng.config.triggerDb), '#f59e0b', 'trigger')
+  if (eng.config.stopOnQuiet) markerLine(ctx, w, y(eng.config.stopDb), '#38bdf8', 'stop')
 
   const hist = eng.history
   if (hist.length > 1) {
-    ctx.strokeStyle = eng.state === 'recording' ? '#f87171' : '#4ade80'
+    ctx.strokeStyle = eng.state === 'idle' ? '#4ade80' : '#f87171'
     ctx.fillStyle = ctx.strokeStyle
     ctx.lineWidth = 1.5
     ctx.beginPath()
@@ -321,23 +325,9 @@ function drawMeter(canvas: HTMLCanvasElement, eng: LiveSoundEngine): void {
   ctx.fillText(reading, 8, 6)
 
   if (eng.state !== 'idle') {
-    const rec = eng.state === 'recording'
-    const badge = rec ? '● REC' : '● LIVE'
-    ctx.fillStyle = rec ? '#f87171' : '#4ade80'
+    const badge = '● REC'
+    ctx.fillStyle = '#f87171'
     ctx.fillText(badge, w - ctx.measureText(badge).width - 8, 6)
-  }
-
-  // If the trace is pinned to the bottom edge, the mic is probably not the
-  // one being spoken into (or it's muted). Say so instead of looking dead.
-  if (eng.state !== 'idle' && eng.levelDb < METER_MIN) {
-    ctx.font = '11px ui-monospace, monospace'
-    ctx.fillStyle = '#fbbf24'
-    ctx.textBaseline = 'alphabetic'
-    ctx.fillText(
-      'no signal — is the selected mic the one you are speaking into (and not muted)?',
-      8,
-      h - 8,
-    )
   }
 }
 
@@ -365,18 +355,30 @@ function Field(props: {
   step: number
   onChange: (v: number) => void
 }) {
+  // While the field is focused it shows a local draft of what the user typed;
+  // the value is committed (and clamped by the engine) only on blur or Enter.
+  // Otherwise mid-typing states — "1" while typing "15" — would snap to the
+  // clamp (min 5 s) and make the field uneditable.
+  const [draft, setDraft] = useState<string | null>(null)
+  const commit = (text: string) => {
+    setDraft(null)
+    const v = Number(text)
+    if (text.trim() !== '' && Number.isFinite(v)) props.onChange(v)
+  }
   return (
     <label className="text-xs">
       <span className="block text-neutral-500 mb-1">{props.label}</span>
       <input
         type="number"
-        value={props.value}
+        value={draft ?? String(props.value)}
         min={props.min}
         max={props.max}
         step={props.step}
-        onChange={(e) => {
-          const v = Number(e.target.value)
-          if (Number.isFinite(v)) props.onChange(v)
+        onFocus={() => setDraft(String(props.value))}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={(e) => commit(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur()
         }}
         className="w-full rounded bg-neutral-950 border border-neutral-800 px-2 py-1 text-neutral-200 outline-none focus:border-neutral-500"
       />
@@ -397,6 +399,20 @@ function SaveCard({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string | nu
         </p>
       ) : (
         <>
+          <label className="flex items-center gap-2 text-xs mb-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={eng.config.autoSave}
+              onChange={(e) => eng.setConfig({ autoSave: e.target.checked })}
+              className="accent-amber-500"
+            />
+            <span className="text-neutral-200">Auto-save clips to folder</span>
+            <span className="text-neutral-500">
+              {eng.config.autoSave
+                ? 'kept clips are written the moment they end'
+                : 'off = clips stay in memory until you save them'}
+            </span>
+          </label>
           <div className="flex flex-wrap gap-2">
             <button className={BTN + ' text-sky-300 border-sky-800 hover:bg-sky-950'} onClick={() => run(() => eng.chooseFolder())}>
               Choose folder…
@@ -427,7 +443,10 @@ function SaveCard({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string | nu
           </div>
           {eng.folderName && (
             <p className="text-xs text-emerald-400 mt-2 truncate">
-              → {eng.folderName} — clips auto-save here the moment they finish
+              → {eng.folderName} —{' '}
+              {eng.config.autoSave
+                ? 'clips auto-save here the moment they finish'
+                : 'clips save here when you click “Save clips”'}
             </p>
           )}
         </>
@@ -441,8 +460,10 @@ function SaveCard({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string | nu
 const BADGE: Record<LogEvent['type'], string> = {
   'monitor-start': 'text-emerald-400',
   'monitor-stop': 'text-neutral-500',
+  clip: 'text-neutral-400',
   trigger: 'text-amber-400',
   stop: 'text-sky-400',
+  delete: 'text-red-400',
   config: 'text-violet-400',
   calibration: 'text-violet-400',
   folder: 'text-blue-400',
@@ -471,6 +492,11 @@ function ClipsSection({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const [playingId, setPlayingId] = useState<string | null>(null)
   const [, setTick] = useState(0)
+  // Two-step delete: Delete arms the row (button becomes "Confirm"), a
+  // second click actually removes it. The arm auto-cancels after a few
+  // seconds so a stale Confirm can never delete a different clip.
+  const [confirmId, setConfirmId] = useState<string | null>(null)
+  const confirmTimer = useRef<number | null>(null)
 
   // The in-progress clip only appears in the list once it finishes (a full
   // 60 s in continuous mode) — tick at 2 Hz while recording so the progress
@@ -485,6 +511,14 @@ function ClipsSection({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string 
     const a = audioRef.current
     if (a) a.onended = () => setPlayingId(null)
   })
+
+  // Drop any pending delete confirmation on unmount.
+  useEffect(
+    () => () => {
+      if (confirmTimer.current) window.clearTimeout(confirmTimer.current)
+    },
+    [],
+  )
 
   const toggle = (clip: Clip) => {
     let a = audioRef.current
@@ -504,6 +538,32 @@ function ClipsSection({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string 
     setPlayingId(clip.id)
   }
 
+  // Remove a reviewed clip. Stop it first if it's the one playing, so the
+  // revoked URL is never touched mid-playback.
+  const remove = (clip: Clip) => {
+    if (playingId === clip.id) {
+      audioRef.current?.pause()
+      setPlayingId(null)
+    }
+    eng.deleteClip(clip.id)
+  }
+
+  // First click: arm. Second click (within a few seconds): delete.
+  const arm = (clip: Clip) => {
+    if (confirmTimer.current) window.clearTimeout(confirmTimer.current)
+    setConfirmId(clip.id)
+    confirmTimer.current = window.setTimeout(() => setConfirmId(null), 4000)
+  }
+
+  const confirmDelete = (clip: Clip) => {
+    if (confirmTimer.current) {
+      window.clearTimeout(confirmTimer.current)
+      confirmTimer.current = null
+    }
+    setConfirmId(null)
+    remove(clip)
+  }
+
   return (
     <section className="border-t border-neutral-800 max-h-60 overflow-y-auto">
       <h2 className="px-3 py-2 text-xs uppercase tracking-wider text-neutral-500 sticky top-0 bg-neutral-950">
@@ -511,16 +571,16 @@ function ClipsSection({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string 
       </h2>
       {eng.clips.length === 0 && !eng.activeClip && (
         <p className="px-3 pb-3 text-xs text-neutral-600">
-          {eng.config.gated
-            ? 'No clips yet. Loud moments above the trigger level land here, newest first.'
-            : 'No finished clips yet — the current one is above (or starts when monitoring begins).'}
+          {`No clips yet — a clip is kept when it crosses ${eng.config.triggerDb} dBFS${
+            eng.config.stopOnQuiet ? ', or when the sound goes quiet' : ''
+          }. Quiet clips are discarded (still recorded in the event log).`}
         </p>
       )}
       {eng.activeClip && (
         <div className="flex items-center gap-3 px-3 py-1.5 border-b border-neutral-900 text-xs bg-red-950/20">
           <span className="text-red-400 animate-pulse">● REC</span>
           <span className="font-mono text-neutral-200">
-            recording — file saves automatically when it finishes
+            {`recording — kept when it crosses ${eng.config.triggerDb} dBFS (or at ${eng.config.maxClipSec} s)`}
           </span>
           <span className="ml-auto text-neutral-400 tabular-nums whitespace-nowrap">
             {clock(eng.activeClip.ageSec)} / {clock(eng.config.maxClipSec)}
@@ -552,6 +612,23 @@ function ClipsSection({ eng, onErr }: { eng: LiveSoundEngine; onErr: (m: string 
             >
               Download
             </a>
+            {confirmId === c.id ? (
+              <button
+                className={BTN + ' text-red-200 border-red-500 bg-red-900/60 animate-pulse'}
+                onClick={() => confirmDelete(c)}
+                title="Click again to delete this clip"
+              >
+                Confirm
+              </button>
+            ) : (
+              <button
+                className={BTN + ' text-red-300 border-red-900 hover:bg-red-950'}
+                onClick={() => arm(c)}
+                title={c.saved ? 'Remove from the list — a copy stays in the save folder' : 'Remove from the list — no copy exists on disk'}
+              >
+                Delete
+              </button>
+            )}
           </span>
         </div>
       ))}

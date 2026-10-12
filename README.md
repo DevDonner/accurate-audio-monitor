@@ -1,11 +1,12 @@
 # Live Sound Capture — Lab
 
 **Lab #2 for the [DevDonner portfolio](https://github.com/DevDonner/portfolioWebsite).**
-An always-recording noise witness: pick a mic and a folder, and it records
-continuously — timestamped 16-bit WAV clips (60 s each by default) plus a
-full event log, auto-saved straight into the folder the moment each clip
-finishes. A loud-sound gate (opt-in) switches it to "only record the loud
-moments" mode.
+An always-recording noise witness: pick a mic and it records continuously
+from the moment it starts — timestamped 16-bit WAV clips plus a full event
+log. The moment the level crosses the trigger (default −20 dBFS) the current
+clip is kept and a new one begins; clips that never reach the trigger are
+discarded, so what lands in your save folder (opt-in auto-save, or one
+click) is the loud moments.
 
 > **Pitch:** "A night-watchman for your microphone. It records all night,
 > writes nothing but the evidence — each clip a WAV, every second logged."
@@ -14,8 +15,8 @@ moments" mode.
 - [x] Repo scaffolded (2026-10-12)
 - [x] Engine: detection state machine, pre-roll, WAV encoder
 - [x] UI: meter, thresholds, calibration, activity feed, clip list
-- [x] Save flow: File System Access folder + event log export (auto-save on clip end, folder persists across reloads)
-- [x] Default mode: continuous recording (gate is opt-in)
+- [x] Save flow: File System Access folder + event log export (opt-in auto-save, folder persists across reloads)
+- [x] Always recording: a clip is always running; the trigger keeps + saves it
 - [ ] Verified end-to-end on real hardware (record → save → playback)
 - [ ] Hosted at `portfolio.devdonner…/lab/live-sound-capture` (placeholder — see portfolio repo)
 
@@ -29,20 +30,25 @@ verified by a production build.
 
 ## How it works
 
-- **Always recording (default).** A mic is selected via `getUserMedia`
-  (device picker). An `AudioWorklet` computes RMS per 128-sample quantum and
-  posts it to the page. No echo cancellation, noise suppression, or AGC — the
-  sound is left exactly as the mic heard it. By default there is **no level
-  gate**: a clip runs from start until it hits the max length (default 60 s),
-  then the next one begins. Nothing is missed, no matter how quiet the room
-  or how high the threshold would have been. Consecutive files overlap by the
-  pre-roll (~2 s) so no second is lost between them.
-- **Loud-sound gate (opt-in).** Tick "Gate on loud sound" and the classic
-  trigger-with-hysteresis state machine takes over: a clip starts when the
-  level stays ≥ *trigger dBFS* for the *trigger hold* (default: −20 dBFS for
-  300 ms, so a single creak doesn't open a six-minute file) and stops when the
-  level stays ≤ *stop dBFS* (default −40) for the *stop hold* (default 2 s),
-  with a hard max clip length (60 s) and minimum clip age (1 s).
+- **Always recording.** A mic is selected via `getUserMedia` (device
+  picker). An `AudioWorklet` computes RMS per 128-sample quantum and posts it
+  to the page. No echo cancellation, noise suppression, or AGC — the sound is
+  left exactly as the mic heard it. A clip is **always running**: monitoring
+  starts one immediately, and the quantum after any clip ends starts the
+  next. Consecutive files overlap by the pre-roll (~2 s) so no second is lost
+  at the seams.
+- **The trigger saves.** The moment the level stays ≥ *trigger dBFS*
+  (default −20) for the *trigger hold* (default 300 ms — so a single creak
+  doesn't open a six-minute file), the current clip ends, is **kept** (the
+  loud moment sits at its tail, with the pre-roll before it), and a new clip
+  begins. The detector re-arms only after the level dips back below the
+  trigger, so sustained loud sound yields max-length clips, not a flood of
+  slivers. Clips whose peak never reaches the trigger are **discarded** —
+  room tone, recorded in the event log but kept out of the live Activity feed, none of it in your folder or memory.
+- **Quiet-stop (optional).** Tick "Stop clip when quiet" and a clip also ends
+  when the level stays ≤ *stop dBFS* (default −40) for the *stop hold*
+  (default 2 s); a minimum clip age (1 s) prevents slivers. Off by default:
+  clips run the full max clip length (default 60 s).
 - **Pre-roll.** A ring buffer keeps the last N seconds (default 2) of audio,
   so each clip starts *before* the noise — the context is part of the record.
 - **WAV, not webm.** Clips are encoded as 16-bit PCM WAV in JS (`wav.ts`,
@@ -50,12 +56,23 @@ verified by a production build.
 - **Event log.** Every trigger, stop, config change, and save is appended to
   an in-memory log with wall-clock (local ISO + UTC) and audio-clock
   timestamps, exported as `noise-events.csv` plus a `session.json` that
-  snapshots the mic, sample rate, thresholds, and calibration.
-- **Auto-save, for real.** The instant a clip finishes it is written to the
-  chosen folder (File System Access API) — no manual "Save" click required.
-  The folder handle is persisted in IndexedDB, so after a reload the app
-  reattaches it automatically (or offers a one-click "Reconnect folder" if the
-  browser wants to re-ask permission).
+  snapshots the mic, sample rate, thresholds, and calibration. The live Activity feed shows only saves and
+   system changes; the full record — discarded room-tone clips and each clip's
+   start — stays in the log and the exported CSV.
+- **Auto-save, opt-in.** Tick "Auto-save clips to folder" and kept clips are
+  written to the chosen folder (File System Access API) the moment they
+  finish — no manual "Save" click. Off by default: clips stay in memory and
+  you save with "Save clips" or the per-clip "Download". The folder handle is
+  persisted in IndexedDB, so after a reload the app reattaches it
+  automatically (or offers a one-click "Reconnect folder" if the browser wants
+  to re-ask permission).
+- **Review, then prune.** Every clip row has Play and **Delete**: hear the
+  clip back, and if it isn't good enough, drop it. Deletion is two-step —
+  Delete turns into a pulsing **Confirm** that auto-cancels after a few
+  seconds — so evidence is never lost to a stray click. A deleted clip
+  leaves memory and the deletion is logged (noting whether a copy was
+  already on disk). Files already written to your save folder are never
+  touched by Delete.
 - **Calibration, honestly.** Browsers measure **dBFS** — relative to the
   mic's own digital ceiling — not calibrated sound pressure (dB SPL). A
   single-point calibration (play a known source at the mic, enter its real dB)

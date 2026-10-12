@@ -7,9 +7,15 @@
 //    owns the clock and advances it one 128-sample quantum per message)
 //
 // State machine (runs on the audio-clock, so hold timers are sample-accurate):
-//   IDLE(listening) --db >= triggerDb for triggerHoldMs--> RECORDING
-//   RECORDING --db <= stopDb for stopHoldMs (and clip >= minClipSec)--> IDLE
-//   RECORDING --clip age >= maxClipSec--> IDLE
+//   A clip is ALWAYS running — recording never pauses between clips.
+//   END when the level stays >= triggerDb for triggerHoldMs (trigger; the
+//     detector re-arms only after the level drops back below the trigger)
+//   END when stopOnQuiet and the level stays <= stopDb for stopHoldMs (quiet)
+//   END when clip age >= maxClipSec (max duration)
+//   An ended clip is kept + saved only if it contains audio at/above the
+//   trigger level (peakDb >= triggerDb); everything else is room tone and
+//   gets discarded (the log keeps the record). Auto-save writes kept clips
+//   to the connected folder immediately when config.autoSave is on.
 //
 // Every clip is a 16-bit WAV (wav.ts) including pre-roll from a ring buffer.
 // An append-only event log records everything with wall + audio timestamps.
@@ -18,7 +24,8 @@ import { encodeWav } from './wav'
 import type { Clip, EngineConfig, EngineState, LogEvent, LogType, MicDevice } from './types'
 
 export const DEFAULT_CONFIG: EngineConfig = {
-  gated: false, // continuous recording by default — the safe evidence mode
+  stopOnQuiet: false, // clips run the full maxClipSec unless this is on
+  autoSave: false, // opt-in: write finished clips to the folder the moment they end
   triggerDb: -20,
   stopDb: -40,
   triggerHoldMs: 300,
@@ -168,10 +175,17 @@ interface ActiveClip {
   chunks: Float32Array[]
   length: number
   startTs: number
-  /** AudioContext time the trigger fired (pre-roll not included). */
+  /** AudioContext time the clip started (pre-roll not included). */
   startAudioTime: number
   startDb: number
   peakDb: number
+  /**
+   * Whether the trigger detector is armed for this clip. A clip that starts
+   * while the level is already above the trigger (right after a trigger end)
+   * starts disarmed and only re-arms once the level dips back below — this
+   * keeps sustained loud sound from flooding 0.3 s clips.
+   */
+  armed: boolean
 }
 
 export class LiveSoundEngine {
@@ -210,7 +224,11 @@ export class LiveSoundEngine {
   private pendingFolder: FileSystemDirectoryHandle | null = null
 
   constructor() {
-    this.config = { ...DEFAULT_CONFIG, ...(loadJson<Partial<EngineConfig>>(CONFIG_KEY) ?? {}) }
+    const stored = loadJson<Partial<EngineConfig>>(CONFIG_KEY) ?? {}
+    // `gated` existed before the always-recording redesign — drop it so it
+    // can't linger in the live config object.
+    delete (stored as Record<string, unknown>).gated
+    this.config = { ...DEFAULT_CONFIG, ...stored }
     const cal = loadJson<number>(CAL_KEY)
     this.calibration = typeof cal === 'number' && Number.isFinite(cal) ? cal : null
   }
@@ -229,7 +247,13 @@ export class LiveSoundEngine {
     for (const fn of this.listeners) fn()
   }
 
-  private pushLog(type: LogType, message: string, db: number | null, clipId: string | null): void {
+  private pushLog(
+    type: LogType,
+    message: string,
+    db: number | null,
+    clipId: string | null,
+    internal = false,
+  ): void {
     const ts = Date.now()
     const e: LogEvent = {
       seq: ++this.seq,
@@ -240,6 +264,8 @@ export class LiveSoundEngine {
       message,
       db,
       clipId,
+      // Only present on background events so the exported CSV / JSON stay clean.
+      ...(internal ? { internal: true } : {}),
     }
     this.log.push(e)
     if (this.log.length > MAX_LOG) this.log.splice(0, this.log.length - MAX_LOG)
@@ -314,13 +340,13 @@ export class LiveSoundEngine {
     this.state = 'listening'
     this.pushLog(
       'monitor-start',
-      this.config.gated
-        ? `Monitoring on “${this.micLabel}” @ ${this.sampleRate} Hz — clips fire above ${this.config.triggerDb} dBFS`
-        : `Monitoring on “${this.micLabel}” @ ${this.sampleRate} Hz — recording continuously, ${this.config.maxClipSec} s clips`,
+      `Monitoring on “${this.micLabel}” @ ${this.sampleRate} Hz — always recording; a clip saves when the level crosses ${this.config.triggerDb} dBFS${
+        this.config.stopOnQuiet ? ', or when the sound goes quiet' : ''
+      } (max ${this.config.maxClipSec} s)`,
       null,
       null,
     )
-    if (!this.config.gated) this.startClip(this.ctx.currentTime, this.levelDb, 'continuous')
+    this.startClip(this.ctx.currentTime, this.levelDb, true)
     this.emit()
   }
 
@@ -341,7 +367,7 @@ export class LiveSoundEngine {
     this.state = 'idle'
     this.pushLog('monitor-stop', 'Monitoring stopped', null, null)
     this.emit()
-    if (this.folder) {
+    if (this.folder && this.config.autoSave) {
       // Keep the evidence folder current with the session record.
       void this.saveEventLog().catch(() => {})
     }
@@ -380,34 +406,41 @@ export class LiveSoundEngine {
     if (this.state !== 'listening' && this.state !== 'recording') return
 
     if (!this.active) {
-      if (this.config.gated) {
-        if (db >= this.config.triggerDb) {
-          this.aboveMs += dtMs
-          if (this.aboveMs >= this.config.triggerHoldMs) this.startClip(now, db, 'trigger')
-        } else {
-          this.aboveMs = 0
-        }
-      } else {
-        // Ungated: a clip must always be running — (re)start immediately.
-        this.startClip(now, db, 'continuous')
-      }
+      // A clip must always be running — (re)start immediately.
+      this.startClip(now, db, true)
     } else {
       this.active.chunks.push(m.samples)
       this.active.length += m.samples.length
       if (db > this.active.peakDb) this.active.peakDb = db
-      if (this.config.gated) {
+
+      // Trigger: re-arm when the level dips below the trigger, then end the
+      // clip as soon as it is sustained above. A clip that starts loud
+      // (right after a trigger) stays disarmed until a dip — no sliver flood.
+      if (!this.active.armed && db < this.config.triggerDb) {
+        this.active.armed = true
+        this.aboveMs = 0
+      }
+      if (this.active.armed) {
+        this.aboveMs = db >= this.config.triggerDb ? this.aboveMs + dtMs : 0
+      }
+      if (this.config.stopOnQuiet) {
         this.belowMs = db <= this.config.stopDb ? this.belowMs + dtMs : 0
       }
 
       const ageSec = now - this.active.startAudioTime
-      if (
-        this.config.gated &&
+      if (this.active.armed && this.aboveMs >= this.config.triggerHoldMs) {
+        this.endClip(`trigger (level crossed ${this.config.triggerDb} dBFS)`, now, db)
+        this.startClip(now, db, false)
+      } else if (
+        this.config.stopOnQuiet &&
         ageSec >= this.config.minClipSec &&
         this.belowMs >= this.config.stopHoldMs
       ) {
         this.endClip('quiet', now, db)
+        this.startClip(now, db, true)
       } else if (ageSec >= this.config.maxClipSec) {
         this.endClip('max duration', now, db)
+        this.startClip(now, db, db < this.config.triggerDb)
       }
     }
   }
@@ -440,7 +473,7 @@ export class LiveSoundEngine {
     return { startTs: a.startTs, ageSec: Math.max(0, (this.lastAudioTime ?? 0) - a.startAudioTime) }
   }
 
-  private startClip(t: number, db: number, reason: 'trigger' | 'continuous'): void {
+  private startClip(t: number, db: number, armed: boolean): void {
     const chunks: Float32Array[] = []
     let length = 0
     if (this.preRoll.length > 0) {
@@ -459,16 +492,23 @@ export class LiveSoundEngine {
       startTs: Date.now(),
       startAudioTime: t,
       startDb: db,
-      peakDb: db,
+      // Only samples accumulated after this clip started count — the loud
+      // boundary moment belongs to the previous clip's tail, not to the
+      // audio this clip will carry.
+      peakDb: DB_FLOOR,
+      armed,
     }
     this.state = 'recording'
+    this.aboveMs = 0
+    this.belowMs = 0
+    // A clip is always running, so "started" is per-clip chatter — keep it in
+    // the log/CSV but out of the user's Activity feed.
     this.pushLog(
-      'trigger',
-      reason === 'continuous'
-        ? `Clip started (gate off) — will run ${this.config.maxClipSec} s`
-        : `Noise ${db.toFixed(1)} dBFS — above ${this.config.triggerDb} dBFS for ${Math.round(this.aboveMs)} ms`,
+      'clip',
+      `Clip started — ends on trigger, ${this.config.stopOnQuiet ? 'quiet, ' : ''}or at ${this.config.maxClipSec} s`,
       db,
       null,
+      true,
     )
     this.emit()
   }
@@ -493,22 +533,42 @@ export class LiveSoundEngine {
       url: URL.createObjectURL(blob),
       saved: false,
     }
-    this.clips.push(clip)
-    while (this.clips.length > MAX_CLIPS) this.evictOldest()
+    // A clip is evidence only if it contains audio at/above the trigger
+    // level. Room tone is discarded — the log keeps the record either way.
+    const keep = clip.peakDb >= this.config.triggerDb
+    this.aboveMs = 0
     this.belowMs = 0
     this.state = 'listening'
-    this.pushLog(
-      'stop',
-      `Stopped (${reason}) at ${db.toFixed(1)} dBFS — noise ${clip.recSec.toFixed(1)} s, file ${clip.fileSec.toFixed(1)} s incl. ${this.config.preRollSec} s pre-roll, peak ${clip.peakDb.toFixed(1)} dBFS`,
-      db,
-      clip.id,
-    )
-    // Evidence must not wait for a manual click: the moment a clip exists,
-    // it goes to the save folder if one is connected.
-    if (this.folder) {
-      void this.saveClip(clip).catch((e) =>
-        this.pushLog('error', `Auto-save failed for ${clip.name}: ${errMsgOf(e)}`, null, clip.id),
+    if (keep) {
+      // The moment that matters — surfaced in the user's Activity feed.
+      this.pushLog(
+        'stop',
+        `Saved clip (${reason}) — ${clip.recSec.toFixed(1)} s, peak ${clip.peakDb.toFixed(1)} dBFS, file ${clip.fileSec.toFixed(1)} s incl. ${this.config.preRollSec} s pre-roll`,
+        db,
+        clip.id,
       )
+    } else {
+      // Room tone — kept in the log/CSV as the record, hidden from the user.
+      this.pushLog(
+        'stop',
+        `Stopped (${reason}) at ${db.toFixed(1)} dBFS — ${clip.recSec.toFixed(1)} s — discarded, never reached ${this.config.triggerDb} dBFS (peak ${clip.peakDb.toFixed(1)} dBFS)`,
+        db,
+        null,
+        true,
+      )
+    }
+    if (keep) {
+      this.clips.push(clip)
+      while (this.clips.length > MAX_CLIPS) this.evictOldest()
+      // Opt-in: when auto-save is on, the moment a clip exists it goes to
+      // the connected folder.
+      if (this.folder && this.config.autoSave) {
+        void this.saveClip(clip).catch((e) =>
+          this.pushLog('error', `Auto-save failed for ${clip.name}: ${errMsgOf(e)}`, null, clip.id),
+        )
+      }
+    } else {
+      URL.revokeObjectURL(clip.url)
     }
     this.emit()
   }
@@ -525,12 +585,34 @@ export class LiveSoundEngine {
     )
   }
 
+  /**
+   * Drop a reviewed clip from the list. Its object URL is revoked; the
+   * deletion is logged so the event record stays honest. (The audio itself
+   * is gone from memory — only a re-record recovers it.)
+   */
+  deleteClip(id: string): void {
+    const i = this.clips.findIndex((c) => c.id === id)
+    if (i === -1) return
+    const [clip] = this.clips.splice(i, 1)
+    URL.revokeObjectURL(clip.url)
+    this.pushLog(
+      'delete',
+      `Deleted clip “${clip.name}” — reviewed, not kept. ${
+        clip.saved ? 'A copy exists in the save folder.' : 'No copy was saved to disk.'
+      }`,
+      null,
+      clip.id,
+    )
+    this.emit()
+  }
+
   // ------------------------------------------------------------- config
 
   setConfig(patch: Partial<EngineConfig>): void {
     const c = this.config
     this.config = {
-      gated: patch.gated ?? c.gated,
+      stopOnQuiet: patch.stopOnQuiet ?? c.stopOnQuiet,
+      autoSave: patch.autoSave ?? c.autoSave,
       triggerDb: clamp(patch.triggerDb ?? c.triggerDb, -90, 0),
       stopDb: clamp(patch.stopDb ?? c.stopDb, -90, 0),
       triggerHoldMs: clamp(patch.triggerHoldMs ?? c.triggerHoldMs, 0, 10000),
@@ -541,20 +623,15 @@ export class LiveSoundEngine {
     }
     saveJson(CONFIG_KEY, this.config)
     if (this.state !== 'idle') this.resetPreRoll()
-    // Turning the gate off mid-session should start recording right away.
-    if (
-      !this.config.gated &&
-      this.state === 'listening' &&
-      !this.active &&
-      this.ctx
-    ) {
-      this.startClip(this.ctx.currentTime, this.levelDb, 'continuous')
-    }
     this.pushLog(
       'config',
-      this.config.gated
-        ? `Gate ON — trigger ${this.config.triggerDb} dBFS / stop ${this.config.stopDb} dBFS / hold ${this.config.triggerHoldMs}+${this.config.stopHoldMs} ms`
-        : `Gate OFF — recording continuously, new clip every ${this.config.maxClipSec} s`,
+      `Trigger ${this.config.triggerDb} dBFS (hold ${this.config.triggerHoldMs} ms)${
+        this.config.stopOnQuiet
+          ? `, stop ${this.config.stopDb} dBFS (hold ${this.config.stopHoldMs} ms)`
+          : ''
+      } — clips save on trigger or at ${this.config.maxClipSec} s; auto-save ${
+        this.config.autoSave ? 'on' : 'off'
+      }`,
       null,
       null,
     )
@@ -616,9 +693,17 @@ export class LiveSoundEngine {
     this.folderName = handle.name
     this.pendingFolder = null
     void idbSet('folder', handle).catch(() => {})
-    this.pushLog('folder', `Save folder: “${handle.name}” — auto-saving clips here`, null, null)
-    await this.saveAllClips()
-    await this.saveEventLog()
+    this.pushLog(
+      'folder',
+      `Save folder: “${handle.name}”${this.config.autoSave ? ' — auto-saving clips here' : ' (auto-save off — use “Save clips”)'}`,
+      null,
+      null,
+    )
+    // Only touch the folder automatically when the user asked for it.
+    if (this.config.autoSave) {
+      await this.saveAllClips()
+      await this.saveEventLog()
+    }
     this.emit()
   }
 
@@ -670,8 +755,13 @@ export class LiveSoundEngine {
     this.folder = handle
     this.folderName = handle.name
     this.pendingFolder = null
-    this.pushLog('folder', `Reconnected save folder: “${handle.name}” — auto-saving clips here`, null, null)
-    await this.saveAllClips()
+    this.pushLog(
+      'folder',
+      `Reconnected save folder: “${handle.name}”${this.config.autoSave ? ' — auto-saving clips here' : ''}`,
+      null,
+      null,
+    )
+    if (this.config.autoSave) await this.saveAllClips()
     this.emit()
   }
 
