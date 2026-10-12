@@ -8,7 +8,10 @@ import tailwindcss from '@tailwindcss/vite'
 // explicitly — normal node_modules walking can't reach us from one level up.
 const nm = (p: string) => fileURLToPath(new URL(`./node_modules/${p}`, import.meta.url))
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // GitHub Pages serves the repo under /accurate-audio-monitor/ — the
+  // production build needs that base; local `vite dev` stays at the root.
+  base: command === 'build' ? '/accurate-audio-monitor/' : '/',
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
@@ -19,4 +22,4 @@ export default defineConfig({
       react: nm('react/index.js'),
     },
   },
-})
+}))
