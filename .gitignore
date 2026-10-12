@@ -1,0 +1,8 @@
+# Dev harness (local tooling — never ported to the host repo)
+dev/node_modules/
+dev/dist/
+dev/.vite/
+
+# OS junk
+.DS_Store
+Thumbs.db
